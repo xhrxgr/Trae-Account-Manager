@@ -1,0 +1,41 @@
+// 账号简要信息
+export interface AccountBrief {
+  id: string;
+  name: string;
+  email: string;
+  avatar_url: string;
+  plan_type: string;
+  is_active: boolean;
+  created_at: number;
+  machine_id: string | null;
+  is_current: boolean; // 是否是当前 Trae IDE 正在使用的账号
+  token_expired_at: string | null; // Token 过期时间
+  source: string; // 账号来源: "browser", "local", "manual"
+  note: string | null; // 用户自定义备注
+}
+
+// 完整账号信息
+export interface Account {
+  id: string;
+  name: string;
+  email: string;
+  avatar_url: string;
+  cookies: string;
+  jwt_token: string | null;
+  token_expired_at: string | null;
+  user_id: string;
+  tenant_id: string;
+  region: string;
+  plan_type: string;
+  created_at: number;
+  updated_at: number;
+  is_active: boolean;
+  machine_id: string | null;
+  source: string;
+  note: string | null;
+}
+
+// API 错误
+export interface ApiError {
+  message: string;
+}

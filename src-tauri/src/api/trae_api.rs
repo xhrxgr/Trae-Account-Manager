@@ -1,0 +1,399 @@
+use anyhow::{anyhow, Result};
+use reqwest::{header, Client};
+use serde_json::json;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+use super::types::*;
+
+const API_BASE_CN: &str = "https://api.trae.cn";
+
+/// Trae API 客户端
+pub struct TraeApiClient {
+    client: Client,
+    cookies: String,
+    jwt_token: Option<String>,
+    api_base: String,
+}
+
+impl TraeApiClient {
+    /// 创建新的 API 客户端（使用 Cookies）
+    pub fn new(cookies: &str) -> Result<Self> {
+        let client = Client::builder()
+            .build()?;
+
+        // 清理 Cookie 字符串：移除换行符、多余空格
+        let cleaned_cookies = cookies
+            .lines()
+            .map(|line| line.trim())
+            .collect::<Vec<_>>()
+            .join("")
+            .replace("  ", " ");
+
+        // 从 cookies 中检测区域
+        let api_base = Self::detect_api_base_from_cookies(&cleaned_cookies);
+
+        Ok(Self {
+            client,
+            cookies: cleaned_cookies,
+            jwt_token: None,
+            api_base,
+        })
+    }
+
+    /// 创建新的 API 客户端（使用 Token）
+    pub fn new_with_token(token: &str) -> Result<Self> {
+        let client = Client::builder()
+            .build()?;
+
+        Ok(Self {
+            client,
+            cookies: String::new(),
+            jwt_token: Some(token.to_string()),
+            api_base: API_BASE_CN.to_string(),
+        })
+    }
+
+    /// 从 Cookies 中检测 API 端点
+    fn detect_api_base_from_cookies(_cookies: &str) -> String {
+        API_BASE_CN.to_string()
+    }
+
+    /// 构建请求头（仅使用 Token，不需要 Cookies）
+    fn build_headers_token_only(&self) -> Result<header::HeaderMap> {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse()?);
+        headers.insert(header::ACCEPT, "application/json, text/plain, */*".parse()?);
+        
+        headers.insert(header::ORIGIN, "https://www.trae.cn".parse()?);
+        headers.insert(header::REFERER, "https://www.trae.cn/".parse()?);
+        
+        headers.insert(
+            header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36".parse()?,
+        );
+
+        if let Some(token) = &self.jwt_token {
+            let auth_value = header::HeaderValue::from_bytes(
+                format!("Cloud-IDE-JWT {}", token).as_bytes()
+            ).map_err(|e| anyhow!("Token 格式错误: {}", e))?;
+            headers.insert(header::AUTHORIZATION, auth_value);
+        }
+
+        Ok(headers)
+    }
+
+    /// 通过 Token 获取用户信息
+    pub async fn get_user_info_by_token(&self) -> Result<TokenUserInfo> {
+        // 先解析 JWT Token 获取基本信息
+        let token = self.jwt_token.as_ref().ok_or_else(|| anyhow!("Token 不存在"))?;
+        let jwt_data = Self::parse_jwt_token(token)?;
+
+        // 优先尝试调用 GetUserInfo 接口获取真实用户名
+        let headers = self.build_headers_token_only()?;
+        let user_info_url = format!("{}/cloudide/api/v3/trae/GetUserInfo", API_BASE_CN);
+        
+        let user_info_response = self
+            .client
+            .post(&user_info_url)
+            .headers(headers.clone())
+            .json(&json!({"IfWebPage": true}))
+            .send()
+            .await;
+
+        if let Ok(resp) = user_info_response {
+            if resp.status().is_success() {
+                if let Ok(user_info) = resp.json::<GetUserInfoResponse>().await {
+                    return Ok(TokenUserInfo {
+                        user_id: user_info.result.user_id.clone(),
+                        tenant_id: user_info.result.tenant_id.clone(),
+                        screen_name: Some(user_info.result.screen_name),
+                        avatar_url: Some(user_info.result.avatar_url),
+                        email: user_info.result.non_plain_text_email,
+                    });
+                }
+            }
+        }
+
+        // 如果 GetUserInfo 失败，回退到 entitlement 接口
+        let mut last_error = anyhow!("API 请求失败");
+        let url = format!("{}/trae/api/v1/pay/user_current_entitlement_list", API_BASE_CN);
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&json!({"require_usage": true}))
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                let data: EntitlementListResponse = resp.json().await?;
+                let user_id_from_api = data.user_entitlement_pack_list
+                    .first()
+                    .map(|p| p.entitlement_base_info.user_id.clone())
+                    .unwrap_or_else(|| jwt_data.user_id.clone());
+
+                return Ok(TokenUserInfo {
+                    user_id: user_id_from_api,
+                    tenant_id: jwt_data.tenant_id,
+                    screen_name: Some(jwt_data.user_id.clone()),
+                    avatar_url: None,
+                    email: None,
+                });
+            }
+            Ok(resp) => {
+                last_error = anyhow!("API 返回错误: {}", resp.status());
+            }
+            Err(e) => {
+                last_error = anyhow!("请求失败: {}", e);
+            }
+        }
+        Err(last_error)
+    }
+
+    /// 解析 JWT Token 获取用户信息
+    fn parse_jwt_token(token: &str) -> Result<JwtPayload> {
+        // JWT 格式: header.payload.signature
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(anyhow!("无效的 JWT Token 格式"));
+        }
+
+        // 解码 payload 部分（第二部分）
+        let payload_b64 = parts[1];
+        // JWT 使用 base64url 编码，需要处理 padding
+        let padding = (4 - payload_b64.len() % 4) % 4;
+        let padded = format!("{}{}", payload_b64, "=".repeat(padding));
+        // 替换 base64url 字符为标准 base64
+        let standard_b64 = padded.replace('-', "+").replace('_', "/");
+
+        let payload_bytes = BASE64.decode(&standard_b64)
+            .map_err(|e| anyhow!("解码 JWT payload 失败: {}", e))?;
+
+        let payload_str = String::from_utf8(payload_bytes)
+            .map_err(|e| anyhow!("JWT payload 不是有效的 UTF-8: {}", e))?;
+
+        let payload: JwtPayloadRaw = serde_json::from_str(&payload_str)
+            .map_err(|e| anyhow!("解析 JWT payload 失败: {}", e))?;
+
+        Ok(JwtPayload {
+            user_id: payload.data.id,
+            tenant_id: payload.data.tenant_id,
+        })
+    }
+
+    /// 构建请求头
+    fn build_headers(&self, with_auth: bool) -> Result<header::HeaderMap> {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse()?);
+        headers.insert(header::ACCEPT, "application/json, text/plain, */*".parse()?);
+
+        // 使用 from_bytes 来处理包含特殊字符的 Cookie
+        let cookie_value = header::HeaderValue::from_bytes(self.cookies.as_bytes())
+            .map_err(|e| anyhow!("Cookie 格式错误: {}", e))?;
+        headers.insert(header::COOKIE, cookie_value);
+
+        headers.insert(header::ORIGIN, "https://www.trae.cn".parse()?);
+        headers.insert(header::REFERER, "https://www.trae.cn/".parse()?);
+        headers.insert(
+            header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36".parse()?,
+        );
+
+        if with_auth {
+            if let Some(token) = &self.jwt_token {
+                let auth_value = header::HeaderValue::from_bytes(
+                    format!("Cloud-IDE-JWT {}", token).as_bytes()
+                ).map_err(|e| anyhow!("Token 格式错误: {}", e))?;
+                headers.insert(header::AUTHORIZATION, auth_value);
+            }
+        }
+
+        Ok(headers)
+    }
+
+    /// 获取用户 Token
+    pub async fn get_user_token(&mut self) -> Result<UserTokenResult> {
+        let url = format!("{}/cloudide/api/v3/common/GetUserToken", self.api_base);
+        let headers = self.build_headers(false)?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("获取 Token 失败: {}", response.status()));
+        }
+
+        let data: GetUserTokenResponse = response.json().await?;
+        self.jwt_token = Some(data.result.token.clone());
+        Ok(data.result)
+    }
+
+    /// 获取用户信息
+    pub async fn get_user_info(&self) -> Result<UserInfoResult> {
+        let url = format!("{}/cloudide/api/v3/trae/GetUserInfo", API_BASE_CN);
+        let headers = self.build_headers(false)?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&json!({"IfWebPage": true}))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("获取用户信息失败: {}", response.status()));
+        }
+
+        let data: GetUserInfoResponse = response.json().await?;
+        Ok(data.result)
+    }
+
+    /// 获取用户配额和使用量
+    pub async fn get_entitlement_list(&self) -> Result<EntitlementListResponse> {
+        let url = format!("{}/trae/api/v1/pay/user_current_entitlement_list", self.api_base);
+        let headers = self.build_headers(true)?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .json(&json!({"require_usage": true}))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("获取配额信息失败: {}", response.status()));
+        }
+
+        let data: EntitlementListResponse = response.json().await?;
+        Ok(data)
+    }
+
+    /// 获取使用量汇总（简化版，用于前端展示）
+    pub async fn get_usage_summary(&mut self) -> Result<UsageSummary> {
+        // 确保有 token
+        if self.jwt_token.is_none() {
+            self.get_user_token().await?;
+        }
+
+        let entitlements = self.get_entitlement_list().await?;
+        self.parse_entitlements_to_summary(entitlements)
+    }
+
+    /// 通过 Token 获取使用量汇总
+    pub async fn get_usage_summary_by_token(&self) -> Result<UsageSummary> {
+        let headers = self.build_headers_token_only()?;
+        let url = format!("{}/trae/api/v1/pay/user_current_entitlement_list", API_BASE_CN);
+        println!("[DEBUG] Trying API endpoint: {}", url);
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers.clone())
+            .json(&json!({"require_usage": true}))
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                let response_text = resp.text().await?;
+                println!("[DEBUG] API Response: {}", response_text);
+
+                let entitlements: EntitlementListResponse = serde_json::from_str(&response_text)?;
+                let summary = self.parse_entitlements_to_summary(entitlements)?;
+                println!("[DEBUG] Parsed Summary: fast_request_limit={}, extra_fast_request_limit={}",
+                    summary.fast_request_limit, summary.extra_fast_request_limit);
+                Ok(summary)
+            }
+            Ok(resp) => {
+                Err(anyhow!("API 返回错误: {}", resp.status()))
+            }
+            Err(e) => {
+                Err(anyhow!("请求失败: {}", e))
+            }
+        }
+    }
+
+    /// 解析配额信息为使用量汇总
+    fn parse_entitlements_to_summary(&self, entitlements: EntitlementListResponse) -> Result<UsageSummary> {
+        let mut summary = UsageSummary::default();
+        summary.is_cn = true;
+
+        // CN 特有信息
+        summary.is_pay_freshman = entitlements.is_pay_freshman;
+        if let Some(trial) = &entitlements.trial_status {
+            summary.is_trial_eligible = trial.is_eligible_for_trial;
+            summary.is_in_trial = trial.is_in_trial;
+            summary.trial_end_time = trial.trial_end_time;
+        }
+
+        for pack in entitlements.user_entitlement_pack_list {
+            let base = &pack.entitlement_base_info;
+            let usage = &pack.usage;
+            let quota = &base.quota;
+
+            // CN 免费版：limits 为 0 表示"无明确限制"或"免费"
+            summary.solo_agent_parallel_limit = quota.solo_agent_parallel_limit;
+            summary.plan_display_desc = pack.display_desc.clone().unwrap_or_default();
+
+            // 判断是否是额外礼包（product_type == 2）
+            if base.product_type == 2 {
+                // Extra Package
+                summary.extra_fast_request_limit = quota.premium_model_fast_request_limit;
+                summary.extra_fast_request_used = usage.premium_model_fast_amount;
+                summary.extra_fast_request_left =
+                    summary.extra_fast_request_limit as f64 - summary.extra_fast_request_used;
+                summary.extra_expire_time = base.end_time;
+
+                if let Some(pkg_extra) = &base.product_extra.package_extra {
+                    if pkg_extra.package_source_type == 6 {
+                        summary.extra_package_name = "2026 Anniversary Treat".to_string();
+                    }
+                }
+            } else {
+                // Free/Pro Plan
+                let plan_from_id = if base.product_id == 0 { "Free" } else { "Pro" };
+                // CN 优先使用 display_desc
+                if summary.plan_display_desc.is_empty() {
+                    summary.plan_display_desc = plan_from_id.to_string();
+                }
+                summary.plan_type = if summary.plan_display_desc.is_empty() {
+                    plan_from_id.to_string()
+                } else {
+                    summary.plan_display_desc.clone()
+                };
+                summary.is_free_plan = base.product_id == 0 && base.charge_amount == 0;
+                summary.reset_time = base.end_time;
+
+                summary.fast_request_limit = quota.premium_model_fast_request_limit;
+                summary.fast_request_used = usage.premium_model_fast_amount;
+                summary.fast_request_left =
+                    summary.fast_request_limit as f64 - summary.fast_request_used;
+
+                summary.slow_request_limit = quota.premium_model_slow_request_limit;
+                summary.slow_request_used = usage.premium_model_slow_amount;
+                summary.slow_request_left =
+                    summary.slow_request_limit as f64 - summary.slow_request_used;
+
+                summary.advanced_model_limit = quota.advanced_model_request_limit;
+                summary.advanced_model_used = usage.advanced_model_amount;
+                summary.advanced_model_left =
+                    summary.advanced_model_limit as f64 - summary.advanced_model_used;
+
+                summary.autocomplete_limit = quota.auto_completion_limit;
+                summary.autocomplete_used = usage.auto_completion_amount;
+                summary.autocomplete_left =
+                    summary.autocomplete_limit as f64 - summary.autocomplete_used;
+            }
+        }
+
+        Ok(summary)
+    }
+}

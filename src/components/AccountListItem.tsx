@@ -1,0 +1,111 @@
+interface AccountListItemProps {
+  account: {
+    id: string;
+    name: string;
+    email: string;
+    avatar_url: string;
+    plan_type: string;
+    created_at: number;
+    token_expired_at?: string | null;
+    source?: string;
+    note?: string | null;
+  };
+  selected: boolean;
+  onSelect: (id: string) => void;
+  onContextMenu: (e: React.MouseEvent, id: string) => void;
+}
+
+export function AccountListItem({ account, selected, onSelect, onContextMenu }: AccountListItemProps) {
+  const formatCreatedDate = (timestamp: number) => {
+    if (!timestamp) return "-";
+    const date = new Date(timestamp * 1000);
+    const now = new Date();
+    const diffTime = Math.abs(now.getTime() - date.getTime());
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+    if (diffDays === 0) return "今天";
+    if (diffDays === 1) return "昨天";
+    if (diffDays < 7) return `${diffDays}天前`;
+    if (diffDays < 30) return `${Math.floor(diffDays / 7)}周前`;
+    if (diffDays < 365) return `${Math.floor(diffDays / 30)}个月前`;
+    return `${Math.floor(diffDays / 365)}年前`;
+  };
+
+  const getTokenStatus = (): "normal" | "expiring" | "expired" | "unknown" => {
+    if (!account.token_expired_at) return "unknown";
+    const expiry = new Date(account.token_expired_at).getTime();
+    if (isNaN(expiry)) return "unknown";
+    const now = Date.now();
+    if (expiry < now) return "expired";
+    if (expiry - now < 3600000) return "expiring"; // < 1小时
+    return "normal";
+  };
+
+  const tokenStatus = getTokenStatus();
+
+  return (
+    <div
+      className={`account-list-item ${selected ? "selected" : ""}`}
+      onClick={() => onSelect(account.id)}
+      onContextMenu={(e) => onContextMenu(e, account.id)}
+    >
+      <div className="list-item-checkbox" onClick={(e) => e.stopPropagation()}>
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={() => onSelect(account.id)}
+        />
+      </div>
+
+      <div className="list-item-avatar">
+        {account.avatar_url ? (
+          <img src={account.avatar_url} alt={account.name} />
+        ) : (
+          <div className="avatar-placeholder">
+            {(account.email || account.name).charAt(0).toUpperCase()}
+          </div>
+        )}
+      </div>
+
+      <div className="list-item-info">
+        <span className="list-item-email">{account.email || account.name}</span>
+        <span className="list-item-id">
+          {account.note || (account.source === "browser" ? "浏览器登录" : account.source === "local" ? "本地读取" : account.name)}
+        </span>
+      </div>
+
+      <div className="list-item-plan">
+        <span className="plan-badge">{account.plan_type || "Free"}</span>
+        {account.source === "browser" && <span className="extra-badge">浏览器</span>}
+        {account.source === "local" && <span className="extra-badge">本地</span>}
+      </div>
+
+      <div className="list-item-reset">
+        <span className="reset-label">添加时间</span>
+        <span className="reset-date">{formatCreatedDate(account.created_at)}</span>
+      </div>
+
+      <div className="list-item-status">
+        <span className={`status-dot ${tokenStatus === "expired" ? "expired" : tokenStatus === "expiring" ? "expiring" : "normal"}`}></span>
+        <span>{tokenStatus === "expired" ? "过期" : tokenStatus === "expiring" ? "即将过期" : "正常"}</span>
+      </div>
+
+      <div className="list-item-actions">
+        <button
+          className="action-btn"
+          title="更多操作"
+          onClick={(e) => {
+            e.stopPropagation();
+            onContextMenu(e, account.id);
+          }}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+            <circle cx="12" cy="5" r="2"/>
+            <circle cx="12" cy="12" r="2"/>
+            <circle cx="12" cy="19" r="2"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  );
+}
