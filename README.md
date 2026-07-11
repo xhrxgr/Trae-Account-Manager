@@ -3,7 +3,7 @@
 <div align="center">
 
 ![TRAE Work CN Account Manager](https://img.shields.io/badge/TRAE%20Work%20CN-Account%20Manager-blue?style=for-the-badge)
-![Version](https://img.shields.io/badge/version-1.0.6-green?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-1.0.7-green?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-orange?style=for-the-badge)
 
@@ -27,6 +27,7 @@
 - 浏览器登录获取 Token（incognito 模式，自动获取真实用户名和头像）
 - 从本地自动读取已登录账号（自动解密本地认证信息）
 - 一键切换账号（自动关闭进程、写入登录信息、重新启动）
+- 多开模式（独立 data-dir 启动多个实例，互不影响，共享插件）
 - 账号导入导出（合并导入 / 替换导入）
 - Token 自动刷新（单个 / 批量）
 - 机器码管理（系统机器码查看/修改/重置、产品机器码、绑定账号）
