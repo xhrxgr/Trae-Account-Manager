@@ -95,12 +95,26 @@ async fn launch_account_multi(account_id: String, state: State<'_, AppState>) ->
 
 // ============ 实例管理命令 ============
 
-/// 获取所有实例
+/// 获取所有实例（快速返回基本信息 + 异步计算运行时信息）
 #[tauri::command]
 async fn list_instances(state: State<'_, AppState>) -> Result<Vec<InstanceBrief>> {
-    let account_manager = state.account_manager.lock().await;
-    let instance_manager = state.instance_manager.lock().await;
-    Ok(instance_manager.list_instances(&account_manager))
+    // 1. 快速获取基本信息（持有锁时间极短）
+    let mut briefs = {
+        let account_manager = state.account_manager.lock().await;
+        let instance_manager = state.instance_manager.lock().await;
+        instance_manager.list_instances_basic(&account_manager)
+    };
+
+    // 2. 在 blocking 线程中计算运行时信息（disk_usage 带缓存 + 批量进程检查）
+    //    避免阻塞 Tauri 的 async 运行时
+    let instance_manager = state.instance_manager.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut manager = instance_manager.blocking_lock();
+        manager.compute_runtime_info(&mut briefs);
+        briefs
+    })
+    .await
+    .map_err(|e| ApiError { message: format!("计算实例运行时信息失败: {}", e) })
 }
 
 /// 创建实例

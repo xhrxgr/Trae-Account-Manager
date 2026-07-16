@@ -52,8 +52,8 @@ export function Instances({ accounts, onRefreshAccounts }: InstancesProps) {
 
   useEffect(() => {
     loadInstances();
-    // 每 5 秒刷新运行状态
-    const interval = setInterval(loadInstances, 5000);
+    // 每 15 秒刷新运行状态（后端有 5 分钟磁盘占用缓存，不会重复计算）
+    const interval = setInterval(loadInstances, 15000);
     return () => clearInterval(interval);
   }, [loadInstances]);
 

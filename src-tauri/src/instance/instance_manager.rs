@@ -1,15 +1,22 @@
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
 use super::types::*;
-use crate::account::{Account, AccountManager};
+use crate::account::AccountManager;
 use crate::machine;
+
+/// 磁盘占用缓存条目: (时间戳秒, 大小字节)
+/// 缓存有效期 5 分钟，避免每次轮询都递归遍历整个 data_dir
+const DISK_CACHE_TTL_SECS: i64 = 300;
 
 /// 实例管理器
 pub struct InstanceManager {
     store: InstanceStore,
     data_path: PathBuf,
+    /// data_dir -> (计算时间戳, 大小) 缓存
+    disk_cache: HashMap<String, (i64, u64)>,
 }
 
 impl InstanceManager {
@@ -24,7 +31,7 @@ impl InstanceManager {
             Self::migrate_from_accounts(account_manager)?
         };
 
-        Ok(Self { store, data_path })
+        Ok(Self { store, data_path, disk_cache: HashMap::new() })
     }
 
     fn get_data_path() -> Result<PathBuf> {
@@ -84,17 +91,15 @@ impl InstanceManager {
         Ok(InstanceStore { instances })
     }
 
-    /// 获取所有实例（含运行时信息）
-    pub fn list_instances(&self, account_manager: &AccountManager) -> Vec<InstanceBrief> {
+    /// 获取所有实例的基本信息（不含 disk_usage 和 is_running，快速）
+    /// 调用方应在锁外用 compute_runtime_info 计算运行时信息
+    pub fn list_instances_basic(&self, account_manager: &AccountManager) -> Vec<InstanceBrief> {
         let accounts = account_manager.get_all_accounts();
         self.store.instances.iter().map(|inst| {
             let (email, name, avatar) = inst.bound_account_id.as_ref()
                 .and_then(|aid| accounts.iter().find(|a| &a.id == aid))
                 .map(|a| (Some(a.email.clone()), Some(a.name.clone()), Some(a.avatar_url.clone())))
                 .unwrap_or((None, None, None));
-
-            let disk_usage = machine::get_dir_size(&inst.data_dir);
-            let (is_running, pid) = machine::is_instance_running(&inst.data_dir);
 
             InstanceBrief {
                 id: inst.id.clone(),
@@ -107,11 +112,50 @@ impl InstanceManager {
                 bound_account_avatar: avatar,
                 machine_id: inst.machine_id.clone(),
                 created_at: inst.created_at,
-                disk_usage,
-                is_running,
-                pid,
+                disk_usage: 0,
+                is_running: false,
+                pid: None,
             }
         }).collect()
+    }
+
+    /// 计算实例的运行时信息（disk_usage 带缓存 + is_running 批量检查）
+    /// 应在 spawn_blocking 中调用，避免阻塞 async 运行时
+    pub fn compute_runtime_info(&mut self, briefs: &mut [InstanceBrief]) {
+        if briefs.is_empty() {
+            return;
+        }
+
+        // 1. 批量检查所有实例的运行状态（一次 tasklist）
+        let data_dirs: Vec<String> = briefs.iter().map(|b| b.data_dir.clone()).collect();
+        let running_info = machine::check_instances_running_batch(&data_dirs);
+        for brief in briefs.iter_mut() {
+            if let Some((_, is_running, pid)) = running_info.iter().find(|(dir, _, _)| *dir == brief.data_dir) {
+                brief.is_running = *is_running;
+                brief.pid = *pid;
+            }
+        }
+
+        // 2. 计算磁盘占用（带缓存，5 分钟内复用，避免每次轮询都递归遍历）
+        let now = chrono::Utc::now().timestamp();
+        for brief in briefs.iter_mut() {
+            // 检查缓存是否有效
+            if let Some((cached_at, cached_size)) = self.disk_cache.get(&brief.data_dir) {
+                if now - cached_at < DISK_CACHE_TTL_SECS {
+                    brief.disk_usage = *cached_size;
+                    continue;
+                }
+            }
+            // 缓存失效或不存在，重新计算
+            let size = machine::get_dir_size(&brief.data_dir);
+            self.disk_cache.insert(brief.data_dir.clone(), (now, size));
+            brief.disk_usage = size;
+        }
+    }
+
+    /// 强制刷新指定实例的磁盘占用缓存（在删除/创建实例后调用）
+    pub fn invalidate_disk_cache(&mut self, data_dir: &str) {
+        self.disk_cache.remove(data_dir);
     }
 
     /// 创建实例
@@ -172,6 +216,9 @@ impl InstanceManager {
             let _ = fs::remove_dir_all(&inst.data_dir);
             println!("[INFO] 已删除实例数据目录: {}", inst.data_dir);
         }
+
+        // 失效磁盘缓存
+        self.invalidate_disk_cache(&inst.data_dir);
 
         self.store.instances.remove(pos);
         self.save_store()?;
