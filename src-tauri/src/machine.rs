@@ -1154,6 +1154,89 @@ pub fn is_instance_running(data_dir: &str) -> (bool, Option<u32>) {
     }
 }
 
+/// 批量检查多个 PID 的存活状态（一次 tasklist 获取所有 TRAE SOLO CN.exe 进程）
+/// 返回 HashMap<PID, bool>，未在输出中的 PID 视为已退出
+#[cfg(target_os = "windows")]
+pub fn check_pids_alive_batch(pids: &[u32]) -> std::collections::HashMap<u32, bool> {
+    use std::collections::HashMap;
+    let mut result: HashMap<u32, bool> = HashMap::new();
+    if pids.is_empty() {
+        return result;
+    }
+
+    // 一次 tasklist 列出所有 TRAE SOLO CN.exe 进程
+    let output = std::process::Command::new("tasklist")
+        .args(["/NH", "/FO", "CSV"])
+        .output();
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        // CSV 格式: "映像名称","PID","会话名","会话#","内存使用"
+        // 或英文: "Image Name","PID","Session Name","Session#","Mem Usage"
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2 {
+                // 去除引号和空白
+                let name = parts[0].trim_matches('"').trim();
+                let pid_str = parts[1].trim_matches('"').trim();
+                // 只关心 TRAE SOLO CN.exe（排除本应用和其他程序）
+                if name.eq_ignore_ascii_case("TRAE SOLO CN.exe") {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        if pids.contains(&pid) {
+                            result.insert(pid, true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 未在结果中的 PID 标记为 false
+    for pid in pids {
+        result.entry(*pid).or_insert(false);
+    }
+    result
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn check_pids_alive_batch(pids: &[u32]) -> std::collections::HashMap<u32, bool> {
+    use std::collections::HashMap;
+    let mut result: HashMap<u32, bool> = HashMap::new();
+    for &pid in pids {
+        let running = unsafe { libc::kill(pid as i32, 0) == 0 };
+        result.insert(pid, running);
+    }
+    result
+}
+
+/// 批量检查多个实例的运行状态（一次 tasklist 获取所有进程，避免每个实例都启动子进程）
+/// 返回 Vec<(data_dir, is_running, pid)>
+pub fn check_instances_running_batch(data_dirs: &[String]) -> Vec<(String, bool, Option<u32>)> {
+    use std::collections::HashMap;
+
+    // 1. 读取所有 data_dir 的 code.lock 获取 PID
+    let pid_map: HashMap<String, Option<u32>> = data_dirs.iter().map(|dir| {
+        let lock_path = std::path::Path::new(dir).join("code.lock");
+        let pid = std::fs::read_to_string(&lock_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        (dir.clone(), pid)
+    }).collect();
+
+    // 2. 收集所有 PID，一次性批量检查
+    let pids: Vec<u32> = pid_map.values().filter_map(|p| *p).collect();
+    let alive_map = check_pids_alive_batch(&pids);
+
+    // 3. 组装结果
+    data_dirs.iter().map(|dir| {
+        match pid_map.get(dir) {
+            Some(Some(pid)) => {
+                let running = *alive_map.get(pid).unwrap_or(&false);
+                (dir.clone(), running, Some(*pid))
+            }
+            _ => (dir.clone(), false, None),
+        }
+    }).collect()
+}
+
 /// 切换 Trae Solo CN 到指定账号
 pub fn switch_solo_cn_account(info: &TraeLoginInfo, machine_id: Option<&str>) -> Result<()> {
     switch_product_account(info, machine_id, ProductType::TraeSoloCn)
